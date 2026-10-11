@@ -29,6 +29,7 @@ DEFAULT_PALETTE_SIZE = 12
 DEFAULT_HEIGHT_EM = 1.0
 X_PADDING_EM_FRACTION = 0.03
 NON_CFF_MESSAGE = "TTF/glyf input not supported yet; pass an OTF (CFF)"
+MULTI_FD_MESSAGE = "CID fonts with multiple Font DICTs are not supported"
 
 
 class BuildError(Exception):
@@ -83,13 +84,42 @@ def reverse_cmap(font: TTFont) -> dict[str, str]:
     return glyph_for_char
 
 
-def missing_characters(triggers: Sequence[str], glyph_for_char: dict[str, str]) -> list[str]:
-    return [
-        f"{char!r} (in {trigger!r})"
-        for trigger in triggers
-        for char in trigger
-        if char not in glyph_for_char
-    ]
+MISSING_CHAR_PREVIEW_COUNT = 3
+
+
+def missing_characters(
+    triggers: Sequence[str],
+    glyph_for_char: dict[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted({char for trigger in triggers for char in trigger if char not in glyph_for_char})
+    )
+
+
+def affected_triggers(
+    triggers: Sequence[str],
+    glyph_for_char: dict[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        trigger for trigger in triggers if any(char not in glyph_for_char for char in trigger)
+    )
+
+
+def format_missing_characters_error(
+    triggers: Sequence[str],
+    glyph_for_char: dict[str, str],
+) -> str:
+    missing = missing_characters(triggers, glyph_for_char)
+    affected = affected_triggers(triggers, glyph_for_char)
+    characters = " ".join(repr(char) for char in missing)
+    if len(affected) <= MISSING_CHAR_PREVIEW_COUNT:
+        where = ", ".join(repr(trigger) for trigger in affected)
+        return f"font cmap missing {len(missing)} character(s): {characters} (in {where})"
+    preview = ", ".join(repr(trigger) for trigger in affected[:MISSING_CHAR_PREVIEW_COUNT])
+    return (
+        f"font cmap missing {len(missing)} character(s): {characters} ; "
+        f"used by {len(affected)} wordart triggers (e.g. {preview})"
+    )
 
 
 def source_image(source: WordArtSource, palette_size: int) -> Image.Image:
@@ -129,6 +159,27 @@ def scale_sources(
     return tuple(scaled_arts), tuple(skipped)
 
 
+def flatten_cid_cff(font: TTFont) -> None:
+    cff = font["CFF "].cff
+    top_level = cff[cff.fontNames[0]]
+    if "ROS" not in top_level.rawDict:
+        return
+
+    _ = top_level.charset
+    _ = top_level.getGlyphOrder()
+    _ = font.getGlyphOrder()
+
+    font_dicts = top_level.FDArray
+    if len(font_dicts) != 1:
+        raise BuildError(MULTI_FD_MESSAGE)
+    private = font_dicts[0].Private
+
+    for key in ("ROS", "FDArray", "FDSelect"):
+        top_level.rawDict.pop(key, None)
+        top_level.__dict__.pop(key, None)
+    top_level.Private = private
+
+
 def add_glyph(font: TTFont, name: str, contours: Sequence[Contour], advance: int) -> None:
     glyph_order = font.getGlyphOrder()
     if name in glyph_order:
@@ -140,7 +191,7 @@ def add_glyph(font: TTFont, name: str, contours: Sequence[Contour], advance: int
     if points:
         left_side_bearing = round(min(point[0] for point in points))
     font["hmtx"].metrics[name] = (advance, left_side_bearing)
-    font["hhea"].numberOfHMetrics = len(font["hmtx"].metrics)   # noqa
+    font["hhea"].numberOfHMetrics = len(font["hmtx"].metrics)    # noqa
 
     cff = font["CFF "].cff
     top_level = cff[cff.fontNames[0]]
@@ -202,6 +253,9 @@ def build_font(
     font = TTFont(str(input_path))
     if "CFF " not in font:
         raise NotImplementedError(NON_CFF_MESSAGE)
+    flatten_cid_cff(font)
+    if "DSIG" in font:
+        del font["DSIG"]
 
     units_per_em = font["head"].unitsPerEm
     target_height = config.height_em * units_per_em
@@ -209,9 +263,9 @@ def build_font(
     glyph_for_char = reverse_cmap(font)
 
     sources = scan_sources(png_dir)
-    missing = missing_characters([source.trigger for source in sources], glyph_for_char)
-    if missing:
-        raise BuildError(f"font cmap missing characters: {', '.join(missing)}")
+    triggers = [source.trigger for source in sources]
+    if missing_characters(triggers, glyph_for_char):
+        raise BuildError(format_missing_characters_error(triggers, glyph_for_char))
 
     scaled_arts, skipped = scale_sources(
         sources,
